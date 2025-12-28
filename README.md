@@ -2,6 +2,10 @@
 
 An intelligent AI assistant built with LangGraph to help HR professionals and startup founders plan effective hiring processes.
 
+## Architecture
+![Architecture](Hiring_Architecture.png)
+
+
 ## Features
 
 - **Intelligent Conversation Flow**: Ask clarifying questions about hiring needs (budget, skills, timeline)
