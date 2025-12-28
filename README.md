@@ -1,4 +1,4 @@
-# HR Hiring Process AI Agent
+# HR Buddy - AI Assistant for Recruitment
 
 An intelligent AI assistant built with LangGraph to help HR professionals and startup founders plan effective hiring processes.
 
