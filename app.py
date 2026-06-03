@@ -109,11 +109,127 @@ def extract_job_positions(text):
     
     return positions
 
+
+def render_chat_message(message):
+    """Render a single chat message (with optional expanders for JD/plan)."""
+    with st.chat_message(message["role"]):
+        st.write(message["content"])
+
+        if (
+            "job descriptions" in message["content"].lower()
+            and "I've created job descriptions" in message["content"]
+        ):
+            hiring_details = st.session_state.memory.get("hiring_needs") or {}
+            if "job_descriptions" in hiring_details:
+                for role, desc in hiring_details["job_descriptions"].items():
+                    with st.expander(f"View {role.upper()} Job Description", expanded=False):
+                        st.markdown(desc)
+
+        if (
+            "hiring plan" in message["content"].lower()
+            and "I've created a hiring plan" in message["content"]
+        ):
+            hiring_details = st.session_state.memory.get("hiring_needs") or {}
+            if "hiring_plan" in hiring_details:
+                for role, plan_json in hiring_details["hiring_plan"].items():
+                    with st.expander(f"View {role.upper()} Hiring Plan", expanded=False):
+                        try:
+                            plan = json.loads(plan_json)
+                            for stage, tasks in plan.items():
+                                st.subheader(stage)
+                                for task in tasks:
+                                    st.write(f"- {task['task']} ({task['timeframe']})")
+                        except Exception:
+                            st.write(plan_json)
+
+
+def process_user_message(user_input):
+    """Run agent for user input and append messages to session state."""
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    st.session_state.analytics.track_message("user", user_input)
+
+    positions = extract_job_positions(user_input)
+    for position in positions:
+        position = position.lower().strip()
+        if position not in st.session_state.tracked_positions:
+            st.session_state.analytics.track_role_request(position)
+            st.session_state.tracked_positions.add(position)
+
+    try:
+        input_state = {"messages": [{"role": "human", "content": user_input}]}
+        response = st.session_state.agent.invoke(input_state)
+
+        assistant_response = ""
+        if "messages" in response:
+            for message in response["messages"]:
+                if hasattr(message, "type") and message.type == "ai":
+                    assistant_response = message.content
+                elif isinstance(message, AIMessage):
+                    assistant_response = message.content
+                elif isinstance(message, dict) and message.get("role") == "assistant":
+                    assistant_response = message.get("content", "")
+
+        if not assistant_response:
+            assistant_response = (
+                "I'm processing your request. Could you provide more details about your hiring needs?"
+            )
+
+        st.session_state.messages.append({"role": "assistant", "content": assistant_response})
+        st.session_state.analytics.track_message("assistant", assistant_response)
+
+        if "search_job_market" in assistant_response:
+            st.session_state.analytics.track_tool_usage("search_job_market")
+        if "draft_job_description" in assistant_response:
+            st.session_state.analytics.track_tool_usage("draft_job_description")
+        if "create_hiring_checklist" in assistant_response:
+            st.session_state.analytics.track_tool_usage("create_hiring_checklist")
+
+        hiring_details = st.session_state.memory.get("hiring_needs") or {}
+        if "roles" in hiring_details:
+            for role in hiring_details["roles"]:
+                role = role.lower().strip()
+                if role not in st.session_state.tracked_positions:
+                    st.session_state.analytics.track_role_request(role)
+                    st.session_state.tracked_positions.add(role)
+
+    except Exception as e:
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": "I'm sorry, I encountered an error processing your request. Please try again or start a new session.",
+        })
+
+
 # App title and configuration
 st.set_page_config(
     page_title="HR Hiring Agent",
     page_icon="👥",
     layout="wide"
+)
+
+st.markdown(
+    """
+    <style>
+    /* Scrollable chat area; input stays below messages */
+    [data-testid="stVerticalBlockBorderWrapper"] {
+        border: none !important;
+    }
+    /* Keep chat input pinned at the bottom of the viewport */
+    [data-testid="stBottomBlockContainer"] {
+        padding-bottom: 0.75rem;
+    }
+    div[data-testid="stChatInput"] {
+        position: sticky;
+        bottom: 0;
+        z-index: 999;
+        background-color: var(--background-color);
+        padding-top: 0.5rem;
+    }
+    section.main .block-container {
+        padding-bottom: 5rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 # Store tracked positions in session state to avoid duplicate counting
@@ -198,7 +314,7 @@ with tab1:
                             "content": message["content"]
                         })
                     
-                    st.experimental_rerun()
+                    st.rerun()
                 except Exception as e:
                     st.error(f"Error loading session: {str(e)}")
                     st.code(traceback.format_exc())
@@ -220,7 +336,7 @@ with tab1:
                     "role": "assistant",
                     "content": "👋 Hi there! I'm your HR assistant. I can help you plan a hiring process for your startup. What roles are you looking to hire for?"
                 })
-                st.experimental_rerun()
+                st.rerun()
             except Exception as e:
                 st.error(f"Error creating new session: {str(e)}")
         
@@ -260,133 +376,21 @@ with tab1:
             if st.button(prompt):
                 # Use session_state to store the selected prompt
                 st.session_state.selected_prompt = prompt
-                st.experimental_rerun()
-    
-    # Display chat messages
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.write(message["content"])
-            
-            # If there are job descriptions or hiring plans in the message, show them in expandable sections
-            if "job descriptions" in message["content"].lower() and "I've created job descriptions" in message["content"]:
-                # Extract job descriptions from the memory
-                hiring_details = st.session_state.memory.get("hiring_needs") or {}
-                if "job_descriptions" in hiring_details:
-                    for role, desc in hiring_details["job_descriptions"].items():
-                        with st.expander(f"View {role.upper()} Job Description", expanded=False):
-                            st.markdown(desc)
-            
-            if "hiring plan" in message["content"].lower() and "I've created a hiring plan" in message["content"]:
-                # Extract hiring plans from the memory
-                hiring_details = st.session_state.memory.get("hiring_needs") or {}
-                if "hiring_plan" in hiring_details:
-                    for role, plan_json in hiring_details["hiring_plan"].items():
-                        with st.expander(f"View {role.upper()} Hiring Plan", expanded=False):
-                            try:
-                                plan = json.loads(plan_json)
-                                for stage, tasks in plan.items():
-                                    st.subheader(stage)
-                                    for task in tasks:
-                                        st.write(f"- {task['task']} ({task['timeframe']})")
-                            except Exception as e:
-                                st.write(plan_json)
-                                st.write(f"Error parsing plan: {str(e)}")
-    
-    # User input
-    user_input = st.chat_input("Type your message here...")
-    
-    # Check if there's a selected prompt from the example buttons
+                st.rerun()
+
+    # Scrollable message history (input stays fixed below)
+    chat_history = st.container(height=520)
+    with chat_history:
+        for message in st.session_state.messages:
+            render_chat_message(message)
+
     if "selected_prompt" in st.session_state:
-        user_input = st.session_state.selected_prompt
-        # Clear the selected prompt
-        del st.session_state.selected_prompt
-    
-    if user_input:
-        # Add user input to messages
-        st.session_state.messages.append({"role": "user", "content": user_input})
-        with st.chat_message("user"):
-            st.write(user_input)
-        
-        # Track message in analytics
-        st.session_state.analytics.track_message("user", user_input)
-        
-        # Extract and track job positions dynamically (only track new positions)
-        positions = extract_job_positions(user_input)
-        for position in positions:
-            # Normalize the position (lowercase and trim)
-            position = position.lower().strip()
-            # Only track if it hasn't been tracked in this session yet
-            if position not in st.session_state.tracked_positions:
-                st.session_state.analytics.track_role_request(position)
-                # Add to tracked positions
-                st.session_state.tracked_positions.add(position)
-        
-        # Get response from agent
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                try:
-                    # Create input state for the agent
-                    input_state = {
-                        "messages": [{"role": "human", "content": user_input}]
-                    }
-                    
-                    # Get response from the agent
-                    response = st.session_state.agent.invoke(input_state)
-                    
-                    # Extract the assistant's message from the response
-                    assistant_response = ""
-                    if "messages" in response:
-                        for message in response["messages"]:
-                            if hasattr(message, "type") and message.type == "ai":
-                                assistant_response = message.content
-                            elif isinstance(message, AIMessage):
-                                assistant_response = message.content
-                            elif isinstance(message, dict) and message.get("role") == "assistant":
-                                assistant_response = message.get("content", "")
-                    
-                    if not assistant_response:
-                        # Fall back to a simple response if we couldn't extract one
-                        assistant_response = "I'm processing your request. Could you provide more details about your hiring needs?"
-                    
-                    # Display the response
-                    st.write(assistant_response)
-                    
-                    # Add to messages
-                    st.session_state.messages.append({"role": "assistant", "content": assistant_response})
-                    
-                    # Track message in analytics
-                    st.session_state.analytics.track_message("assistant", assistant_response)
-                    
-                    # Check for tool usage in the response
-                    if "search_job_market" in assistant_response:
-                        st.session_state.analytics.track_tool_usage("search_job_market")
-                    if "draft_job_description" in assistant_response:
-                        st.session_state.analytics.track_tool_usage("draft_job_description")
-                    if "create_hiring_checklist" in assistant_response:
-                        st.session_state.analytics.track_tool_usage("create_hiring_checklist")
-                    
-                    # Extract positions from hiring details
-                    hiring_details = st.session_state.memory.get("hiring_needs") or {}
-                    if "roles" in hiring_details:
-                        for role in hiring_details["roles"]:
-                            # Normalize the role (lowercase and trim)
-                            role = role.lower().strip()
-                            # Only track if it hasn't been tracked in this session yet
-                            if role not in st.session_state.tracked_positions:
-                                st.session_state.analytics.track_role_request(role)
-                                # Add to tracked positions
-                                st.session_state.tracked_positions.add(role)
-                
-                except Exception as e:
-                    error_msg = f"Error getting response from agent: {str(e)}"
-                    st.error(error_msg)
-                    st.code(traceback.format_exc())
-                    
-                    # Add error message to chat
-                    st.session_state.messages.append({
-                        "role": "assistant", 
-                        "content": "I'm sorry, I encountered an error processing your request. Please try again or start a new session."
-                    })
+        process_user_message(st.session_state.pop("selected_prompt"))
+        st.rerun()
+
+    if user_input := st.chat_input("Type your message here..."):
+        process_user_message(user_input)
+        st.rerun()
 
 with tab2:
     st.header("Usage Analytics")
@@ -465,7 +469,7 @@ with tab2:
             st.session_state.analytics = AnalyticsTracker(st.session_state.session_id, reset=True)
             st.session_state.tracked_positions = set()
             st.success("Analytics counters have been reset!")
-            st.experimental_rerun()
+            st.rerun()
     
     except Exception as e:
         st.error(f"Error loading analytics: {str(e)}")
