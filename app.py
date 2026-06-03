@@ -2,6 +2,7 @@ import os
 import streamlit as st
 from dotenv import load_dotenv
 import json
+import re
 import pandas as pd
 import uuid
 import traceback
@@ -9,14 +10,104 @@ from agent.agent import create_hr_agent
 from agent.memory import SessionMemory, AnalyticsTracker
 from langchain_core.messages import AIMessage, HumanMessage
 
-
-# Load environment variables
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+
+def get_openai_api_key():
+    """Read API key from env (.env locally) or Streamlit Cloud secrets."""
+    key = os.getenv("OPENAI_API_KEY")
+    if key and key.strip():
+        return key.strip()
+    try:
+        key = st.secrets["OPENAI_API_KEY"]
+        if key:
+            return str(key).strip()
+    except (KeyError, FileNotFoundError, AttributeError):
+        pass
+    return None
+
+
+OPENAI_API_KEY = get_openai_api_key()
 
 # Make sure directories exist
 os.makedirs("data/session_data", exist_ok=True)
 os.makedirs("data/analytics", exist_ok=True)
+
+# Function to get session creation time from filename
+def get_session_time(session_file):
+    try:
+        # Try to parse the session file for creation time
+        file_path = os.path.join("data", "session_data", session_file)
+        if os.path.exists(file_path):
+            # Use file modification time as fallback
+            file_time = os.path.getmtime(file_path)
+            
+            # Try to get actual creation time from the file content
+            try:
+                with open(file_path, 'r') as f:
+                    data = json.load(f)
+                    if "created_at" in data:
+                        created_at = data["created_at"]
+                        created_time = datetime.fromisoformat(created_at)
+                        return created_time.timestamp()
+            except:
+                pass
+                
+            return file_time
+    except:
+        # Return a very old timestamp if we can't read the file
+        return 0
+    
+    # Default timestamp
+    return 0
+
+# Function to extract job positions dynamically
+def extract_job_positions(text):
+    """Extract job positions dynamically from text using patterns"""
+    # Common job titles that might appear in conversations
+    common_positions = [
+        "engineer", "developer", "designer", "manager", "director",
+        "intern", "specialist", "analyst", "scientist", "researcher",
+        "coordinator", "assistant", "lead", "head", "chief",
+        "administrator", "consultant", "advisor", "strategist"
+    ]
+    
+    # Common prefixes that might appear before job titles
+    prefixes = [
+        "senior", "junior", "principal", "founding", "lead", "head", 
+        "chief", "associate", "assistant", "software", "hardware", 
+        "data", "product", "project", "marketing", "sales", "genai", 
+        "ai", "ml", "frontend", "backend", "fullstack", "full-stack", 
+        "ui", "ux", "devops", "cloud", "security", "technical"
+    ]
+    
+    # Extract positions based on patterns
+    positions = []
+    
+    # Lowercase the text for easier matching
+    text_lower = text.lower()
+    
+    # First look for complete titles (prefix + position)
+    for prefix in prefixes:
+        for position in common_positions:
+            combined = f"{prefix} {position}"
+            if combined in text_lower:
+                positions.append(combined)
+    
+    # Then look for standalone positions
+    for position in common_positions:
+        # Make sure we're finding whole words, not substrings
+        if re.search(r'\b' + position + r'\b', text_lower):
+            # Only add if not already part of a combined title
+            standalone = True
+            for prefix in prefixes:
+                if f"{prefix} {position}" in text_lower:
+                    standalone = False
+                    break
+            if standalone:
+                positions.append(position)
+    
+    return positions
 
 # App title and configuration
 st.set_page_config(
@@ -24,6 +115,10 @@ st.set_page_config(
     page_icon="👥",
     layout="wide"
 )
+
+# Store tracked positions in session state to avoid duplicate counting
+if "tracked_positions" not in st.session_state:
+    st.session_state.tracked_positions = set()
 
 # Create tabs for chat and analytics
 tab1, tab2 = st.tabs(["Chat", "Analytics"])
@@ -34,6 +129,14 @@ with tab1:
     
     # Initialize session state
     if "session_id" not in st.session_state:
+        if not OPENAI_API_KEY:
+            st.error("OpenAI API key is not configured.")
+            st.info(
+                "In Streamlit Cloud: **Manage app → Settings → Secrets**, add:\n\n"
+                "```toml\nOPENAI_API_KEY = \"sk-your-key-here\"\n```\n\n"
+                "Then click **Reboot app**."
+            )
+            st.stop()
         st.session_state.session_id = str(uuid.uuid4())
         st.session_state.messages = []
         try:
@@ -55,17 +158,25 @@ with tab1:
         st.header("Session Information")
         st.write(f"Session ID: {st.session_state.session_id}")
         
-        # Session management dropdown
+        # Session management dropdown with sorting
         st.subheader("Session Management")
         sessions_dir = os.path.join("data", "session_data")
         os.makedirs(sessions_dir, exist_ok=True)
         sessions = [f for f in os.listdir(sessions_dir) if f.endswith(".json")]
         
         if sessions:
-            session_options = ["Current Session"] + sessions
-            selected_session = st.selectbox("Load Previous Session", session_options)
+            # Sort sessions by creation time (most recent first)
+            sorted_sessions = sorted(sessions, key=get_session_time, reverse=True)
             
-            if selected_session != "Current Session" and selected_session != st.session_state.session_id + ".json":
+            # Ensure current session is first in the list
+            current_session_file = f"{st.session_state.session_id}.json"
+            if current_session_file in sorted_sessions:
+                sorted_sessions.remove(current_session_file)
+            
+            session_options = ["Current Session"] + sorted_sessions
+            selected_session = st.selectbox("Load Session", session_options)
+            
+            if selected_session != "Current Session" and selected_session != current_session_file:
                 try:
                     # Load the selected session
                     new_session_id = selected_session.replace(".json", "")
@@ -73,6 +184,9 @@ with tab1:
                     st.session_state.memory = SessionMemory(new_session_id)
                     st.session_state.agent = create_hr_agent(OPENAI_API_KEY, new_session_id)
                     st.session_state.analytics = AnalyticsTracker(new_session_id)
+                    
+                    # Reset tracked positions for new session
+                    st.session_state.tracked_positions = set()
                     
                     # Load previous messages
                     st.session_state.messages = []
@@ -87,6 +201,7 @@ with tab1:
                     st.experimental_rerun()
                 except Exception as e:
                     st.error(f"Error loading session: {str(e)}")
+                    st.code(traceback.format_exc())
         
         # Add button to start a new session
         if st.button("Start New Session"):
@@ -96,6 +211,10 @@ with tab1:
                 st.session_state.agent = create_hr_agent(OPENAI_API_KEY, st.session_state.session_id)
                 st.session_state.memory = SessionMemory(st.session_state.session_id)
                 st.session_state.analytics = AnalyticsTracker(st.session_state.session_id)
+                
+                # Reset tracked positions for new session
+                st.session_state.tracked_positions = set()
+                
                 # Add a welcome message
                 st.session_state.messages.append({
                     "role": "assistant",
@@ -109,8 +228,8 @@ with tab1:
         st.subheader("Current Hiring Needs")
         hiring_needs = st.session_state.memory.get("hiring_needs") or {}
         
-        if hiring_needs:
-            for role, details in hiring_needs.items():
+        if hiring_needs and "roles" in hiring_needs and hiring_needs["roles"]:
+            for role in hiring_needs["roles"]:
                 st.write(f"**Role:** {role}")
                 # Display skills if available
                 if "skills" in hiring_needs and role in hiring_needs["skills"]:
@@ -191,11 +310,16 @@ with tab1:
         # Track message in analytics
         st.session_state.analytics.track_message("user", user_input)
         
-        # Check for role mentions to track in analytics
-        if "engineer" in user_input.lower():
-            st.session_state.analytics.track_role_request("founding engineer")
-        if "intern" in user_input.lower() or "genai" in user_input.lower():
-            st.session_state.analytics.track_role_request("genai intern")
+        # Extract and track job positions dynamically (only track new positions)
+        positions = extract_job_positions(user_input)
+        for position in positions:
+            # Normalize the position (lowercase and trim)
+            position = position.lower().strip()
+            # Only track if it hasn't been tracked in this session yet
+            if position not in st.session_state.tracked_positions:
+                st.session_state.analytics.track_role_request(position)
+                # Add to tracked positions
+                st.session_state.tracked_positions.add(position)
         
         # Get response from agent
         with st.chat_message("assistant"):
@@ -240,6 +364,18 @@ with tab1:
                         st.session_state.analytics.track_tool_usage("draft_job_description")
                     if "create_hiring_checklist" in assistant_response:
                         st.session_state.analytics.track_tool_usage("create_hiring_checklist")
+                    
+                    # Extract positions from hiring details
+                    hiring_details = st.session_state.memory.get("hiring_needs") or {}
+                    if "roles" in hiring_details:
+                        for role in hiring_details["roles"]:
+                            # Normalize the role (lowercase and trim)
+                            role = role.lower().strip()
+                            # Only track if it hasn't been tracked in this session yet
+                            if role not in st.session_state.tracked_positions:
+                                st.session_state.analytics.track_role_request(role)
+                                # Add to tracked positions
+                                st.session_state.tracked_positions.add(role)
                 
                 except Exception as e:
                     error_msg = f"Error getting response from agent: {str(e)}"
@@ -294,6 +430,10 @@ with tab2:
             
             # Create a simple bar chart
             st.bar_chart(df, x="role", y="count")
+            
+            # Also show data in a table for clarity
+            st.subheader("Role Request Details")
+            st.dataframe(df.sort_values(by="count", ascending=False))
         
         # Session activity over time
         if len(analytics_data["sessions"]) > 1:
@@ -318,6 +458,14 @@ with tab2:
             
             # Create a line chart
             st.line_chart(df, x="date", y="sessions")
+            
+        # Reset analytics button
+        if st.button("Reset Analytics Counters"):
+            # Create a new analytics tracker with a clean slate
+            st.session_state.analytics = AnalyticsTracker(st.session_state.session_id, reset=True)
+            st.session_state.tracked_positions = set()
+            st.success("Analytics counters have been reset!")
+            st.experimental_rerun()
     
     except Exception as e:
         st.error(f"Error loading analytics: {str(e)}")
